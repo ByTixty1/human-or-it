@@ -1,0 +1,6 @@
+server/node_modules
+server/dist
+server/.env
+web/node_modules
+web/.next
+web/.env.local
