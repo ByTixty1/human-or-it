@@ -3,8 +3,8 @@ import http from "http";
 import express from "express";
 import { Server } from "socket.io";
 import { geminiReply, type Turn } from "./llm/gemini.js";
+import type { Major } from "./personas.js";
 
-type Major = "IT" | "IS" | "CS";
 type Room = { id: string; player: string; aiMajor: Major; endsAt: number; history: Turn[] };
 
 const GAME_MS = 120_000;
@@ -13,7 +13,7 @@ const MIN_MSG_INTERVAL_MS = 350;
 
 const app = express();
 
-// permissive CORS for dev
+// Permissive CORS for dev. Lock this down in prod with WEB_ORIGIN.
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
@@ -39,44 +39,49 @@ io.engine.on("connection_error", (err: any) => {
   });
 });
 
-// health
+// Health
 app.get("/health", (_req, res) => res.send("ok"));
 
-// ---- helpers ----
-const pickMajor = (): Major =>
-  (["IT", "IS", "CS"][Math.floor(Math.random() * 3)] as Major);
+// ---------- Anti-reveal helpers ----------
+const DIRECT_MAJOR_PROBE = new RegExp(
+  [
+    "what'?s\\s+your\\s+major",
+    "your\\s+major",
+    "which\\s+major",
+    "are\\s+you\\s+(an?\\s+)?(it|is|cs)\\s+student",
+    "are\\s+you\\s+(it|is|cs)",
+    "do\\s+you\\s+study\\s+(it|is|cs|computer\\s+science|information\\s+systems|information\\s+technology)",
+  ].join("|"),
+  "i"
+);
 
-function pickFallback(major: Major): string {
-  const fallback: Record<Major, string[]> = {
-    IT: [
-      "Just finished setting up a small lab VM. What are you working on?",
-      "Was tweaking a subnet on our course project lol.",
-      "We had a quick lab on Linux services today. You?"
-    ],
-    IS: [
-      "Sketching a BPMN flow for a small case study.",
-      "Looking at a dashboard mockup—trying to pick the right KPIs.",
-      "Reading about data governance terms. Fun stuff 😅"
-    ],
-    CS: [
-      "Debugging a small algorithm from class.",
-      "Practicing some LeetCode before bed.",
-      "Working on a graph problem. What about you?"
-    ],
-  };
-  const arr = fallback[major];
-  return arr[Math.floor(Math.random() * arr.length)];
+// Anything like “I am CS/IT/IS”, “my major is …”
+const REVEAL_PATTERN = new RegExp(
+  [
+    "(?:i\\s*am|i'?m|i\\s*study|my\\s+major\\s+is|i\\s*do)\\s+(?:computer\\s*science|cs|information\\s*systems|is|information\\s*technology|it)\\b",
+    "\\bi\\s*(?:am|'?m)\\s*(?:an?\\s+)?(it|is|cs)\\s+student\\b",
+  ].join("|"),
+  "i"
+);
+
+const genericDeflections = [
+  "Haha nice try — let’s keep it a mystery. What classes are you taking?",
+  "I’ll keep that secret 😄 Tell me about your projects instead!",
+  "Guessing game later — what topics do you enjoy the most?",
+  "Not saying! What’s your favorite course this term?",
+];
+
+function deflect(): string {
+  return genericDeflections[Math.floor(Math.random() * genericDeflections.length)];
 }
 
-function withTimeout<T>(p: Promise<T>, ms = 12000): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const id = setTimeout(() => reject(new Error("llm_timeout")), ms);
-    p.then((v) => { clearTimeout(id); resolve(v); })
-     .catch((e) => { clearTimeout(id); reject(e); });
-  });
+function sanitizeReply(reply: string): string {
+  if (!reply) return deflect();
+  if (REVEAL_PATTERN.test(reply)) return deflect();
+  return reply;
 }
 
-// ---- state ----
+// ---------- Game state ----------
 const rooms = new Map<string, Room>();
 const lastMsgAt = new Map<string, number>();
 
@@ -85,12 +90,13 @@ io.on("connection", (sock) => {
 
   sock.on("join", () => {
     const roomId = `r_${sock.id.slice(0, 6)}`;
-    const aiMajor = pickMajor();
+    const majors: Major[] = ["IT", "IS", "CS"];
+    const aiMajor = majors[Math.floor(Math.random() * majors.length)];
     const endsAt = Date.now() + GAME_MS;
+
     rooms.set(roomId, { id: roomId, player: sock.id, aiMajor, endsAt, history: [] });
     sock.join(roomId);
     io.to(roomId).emit("start", { room: roomId, endsAt });
-    console.log("[io] start", { roomId, aiMajor });
   });
 
   sock.on("msg", async ({ room, text }: { room: string; text: string }) => {
@@ -107,25 +113,32 @@ io.on("connection", (sock) => {
 
     r.history.push({ role: "user", text: clean });
 
-    // show typing while we call the model
+    // If user directly asks about the major, immediately deflect (don’t call LLM)
+    if (DIRECT_MAJOR_PROBE.test(clean)) {
+      const reply = deflect();
+      r.history.push({ role: "model", text: reply });
+      io.to(room).emit("msg", { from: "peer", text: reply, ts: Date.now() });
+      return;
+    }
+
+    // Otherwise call the LLM and then sanitize
     io.to(room).emit("typing", { from: "peer", on: true });
 
     try {
       let reply = "";
       try {
         reply = await withTimeout(geminiReply(r.aiMajor, r.history, clean), 12000);
-      } catch (_) {
-        // timeout or API error → fallback
-        reply = pickFallback(r.aiMajor);
+      } catch {
+        reply = ""; // will fall back below
       }
-      if (!reply || !reply.trim()) reply = pickFallback(r.aiMajor);
+      if (!reply.trim()) reply = deflect();
+      reply = sanitizeReply(reply);
 
-      // tiny human-ish delay
       setTimeout(() => {
         r.history.push({ role: "model", text: reply });
         io.to(room).emit("typing", { from: "peer", on: false });
         io.to(room).emit("msg", { from: "peer", text: reply, ts: Date.now() });
-      }, 350 + Math.random() * 650);
+      }, 300 + Math.random() * 600);
     } catch (e) {
       console.error("[io] reply error:", e);
       io.to(room).emit("typing", { from: "peer", on: false });
@@ -140,15 +153,21 @@ io.on("connection", (sock) => {
     const correct = choice === truth;
     io.to(room).emit("reveal", { truth, correct });
     rooms.delete(room);
-    console.log("[io] reveal", { room, truth, correct });
   });
 
   sock.on("disconnect", () => {
     for (const [id, r] of rooms) if (r.player === sock.id) rooms.delete(id);
     lastMsgAt.delete(sock.id);
-    console.log("[io] disconnected:", sock.id);
   });
 });
+
+function withTimeout<T>(p: Promise<T>, ms = 12000): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const id = setTimeout(() => reject(new Error("llm_timeout")), ms);
+    p.then(v => { clearTimeout(id); resolve(v); })
+     .catch(e => { clearTimeout(id); reject(e); });
+  });
+}
 
 const PORT = Number(process.env.PORT || 3001);
 httpServer.listen(PORT, "0.0.0.0", () => {

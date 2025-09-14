@@ -1,11 +1,8 @@
 import "dotenv/config";
 import { GoogleGenAI } from "@google/genai";
-import { personas, type Major } from "../personas.js";  // note .js and type
+import { personas, type Major } from "../personas.js";
 
-
-const ai = new GoogleGenAI({
-  apiKey: process.env.GEMINI_API_KEY!,
-});
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
 
 export type Turn = { role: "user" | "model"; text: string };
 
@@ -26,9 +23,10 @@ export async function geminiReply(
       systemInstruction: personas[major],
       temperature: 0.9,
       topP: 0.95,
-      maxOutputTokens: 256
-    }
+      maxOutputTokens: 256,
+    },
   });
 
+  // The SDK returns a rich object; .text is the convenient helper
   return (resp as any)?.text ?? "";
 }
