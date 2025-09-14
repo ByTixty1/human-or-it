@@ -39,6 +39,11 @@ io.engine.on("connection_error", (err: any) => {
   });
 });
 
+app.get("/", (_req, res) => {
+  res.type("text").send("human-or-it server is running. Try /health");
+});
+
+
 // Health
 app.get("/health", (_req, res) => res.send("ok"));
 
